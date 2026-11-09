@@ -461,5 +461,5 @@ model = model.to(device)
 vocab_size = 24
 model = train_model(model, train_data_iter, criterion, optimizer, StepLR, num_epochs=100)
 
-torch.save(model.state_dict(), "./TCR_pretrain_model.pkl")
+torch.save(model.state_dict(), "../model/TCR_pretrain_model.pkl")
 print('Model is saved')

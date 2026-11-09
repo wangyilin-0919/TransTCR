@@ -20,7 +20,6 @@ def setup_seed(seed):
     torch.backends.cudnn.deterministic = True
 setup_seed(42)
 
-
 class Embeddings(nn.Module):
     def __init__(self, vocab_size, num_hiddens, dropout, max_len):
         super(Embeddings, self).__init__()
@@ -38,8 +37,8 @@ def sequence_mask(X, valid_len, value=0):
     mask = torch.arange((maxlen), dtype=torch.float32, device=X.device)[None, :].to(device) < valid_len[:, None].to(device)
     X[~mask] = value
     return X
-
     
+
 def masked_softmax(X, valid_lens):
     if valid_lens is None:
         return nn.functional.softmax(X, dim=-1)
@@ -243,6 +242,93 @@ class pMHC_net(nn.Module):
         X_encoder = torch.cat((peptide, MHC), dim=1)
         X_decoder = self.pMHC_decoder(X_encoder, valid_len)
         X = self.fnc(X_decoder.reshape(X_decoder.shape[0], -1))
+        return self.softmax(X), X_encoder, X_decoder
+
+
+class MaskLM(nn.Module):
+    """The masked language model task of BERT."""
+    def __init__(self, vocab_size, num_hiddens, num_inputs, **kwargs):
+        super(MaskLM, self).__init__(**kwargs)
+        self.mlp = nn.Sequential(nn.Linear(num_inputs, num_hiddens),
+                                 nn.ReLU(), 
+                                 nn.LayerNorm(num_hiddens),
+                                 nn.Linear(num_hiddens, vocab_size))
+        
+    def forward(self, X, pred_positions):
+        num_pred_positions = pred_positions.shape[1]
+        pred_positions = pred_positions.reshape(-1)
+        batch_size = X.shape[0]
+        batch_idx = torch.arange(0, batch_size)
+        # Suppose that `batch_size` = 2, `num_pred_positions` = 3, then
+        # `batch_idx` is `torch.tensor([0, 0, 0, 1, 1, 1])`
+        batch_idx = torch.repeat_interleave(batch_idx, num_pred_positions)
+        masked_X = X[batch_idx, pred_positions]
+        masked_X = masked_X.reshape((batch_size, num_pred_positions, -1))
+        mlm_Y_hat = self.mlp(masked_X)
+        return mlm_Y_hat
+    
+    
+class NextSentencePred(nn.Module):
+    def __init__(self, num_inputs, **kwargs):
+        super(NextSentencePred, self).__init__(**kwargs)
+        self.output = nn.Linear(num_inputs, 2)
+
+    def forward(self, X):
+        return self.output(X)
+    
+
+class Transformer(nn.Module):
+    def __init__(self, **kwargs):
+        super(Transformer, self).__init__()
+        # Encoder
+        self.encoder = Encoder(key_size=64, query_size=64, value_size=64, vocab_size=24, num_hiddens=64,
+                               norm_shape=[64], ffn_num_input=64, ffn_num_hiddens=128,
+                               num_heads=2, num_layers=2, 
+                               dropout_embedding=0.01, dropout_addnorm=0.01, dropout_attention=0.01, 
+                               use_bias=False)
+        self.hidden = nn.Sequential(nn.Linear(64, 64),
+                                    nn.Tanh())
+        self.mlm = MaskLM(vocab_size=24, num_hiddens=64, num_inputs=64)
+        self.nsp = NextSentencePred(num_inputs=64)
+        
+    def forward(self, tokens, segments, valid_len, pred_positions=None):
+        encoded_X = self.encoder(tokens, segments, valid_len)
+        if pred_positions is not None:
+            mlm_Y_hat = self.mlm(encoded_X, pred_positions)
+        else:
+            mlm_Y_hat = None
+        nsp_Y_hat = self.nsp(self.hidden(encoded_X[:, 0, :]))
+        return encoded_X, mlm_Y_hat, nsp_Y_hat
+
+
+class TCR_net(nn.Module):
+    def __init__(self, **kwargs):
+        super(TCR_net, self).__init__()
+        # Decoder
+        self.decoder = Decoder(key_size=64, query_size=64, value_size=64, vocab_size=64, num_hiddens=64,
+                               norm_shape=[64], ffn_num_input=64, ffn_num_hiddens=128,
+                               num_heads=1, num_layers=2, 
+                               dropout_embedding=0, dropout_addnorm=0, dropout_attention=0, 
+                               use_bias=False)
+        # Classify Head
+        self.fnc = nn.Sequential(nn.Linear(6208, 2048),
+                                 nn.ReLU(),
+                                 nn.BatchNorm1d(2048),
+                                 #nn.Dropout(p=0.1),
+                                 nn.Linear(2048, 64),
+                                 nn.ReLU(),
+                                 nn.BatchNorm1d(64),
+                                 nn.Linear(64, 2))
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, encoder_TCR, encoder_pMHC, valid_len_pMT_res):
+        # TCR-pMHC
+        X = torch.cat((encoder_TCR, encoder_pMHC), dim=1)
+        # Decoder
+        X = self.decoder(X, valid_len_pMT_res)
+        # Classify Head
+        print(X.reshape(X.shape[0], -1).shape)
+        X = self.fnc(X.reshape(X.shape[0], -1))
         return self.softmax(X)
 
 
@@ -262,9 +348,14 @@ class TCR_DataSet(Data.Dataset):
         vocab = {"A": 0, "R": 1, "N": 2, "D": 3, "C": 4, "Q": 5, "E": 6, "G": 7, "H": 8, "I": 9,
                  "L": 10, "K": 11, "M": 12, "F": 13, "P": 14, "S": 15, "T": 16, "W": 17, "Y": 18, "V": 19,
                  "<cls>": 20, "<sep>": 21, "<pad>": 22}
+        TRB = data["TCRB"].to_list()
+        TRA = data["TCRA"].to_list()
         MHC = data["MHC"].to_list()
         peptide = data["Peptide"].to_list()
         labels = data["labels"].to_list()
+        tokens_TCR_res = []
+        segments_TCR_res = []
+        valid_len_TCR_res = []
         tokens_MHC_res = []
         segments_MHC_res = []
         valid_len_MHC_res = []
@@ -272,7 +363,19 @@ class TCR_DataSet(Data.Dataset):
         segments_peptide_res = []
         valid_len_peptide_res = []
         valid_len_pMHC_res = []
-        for i in range(len(MHC)):
+        valid_len_pMT_res = []
+        for i in range(len(TRB)):
+            # TCR
+            if TRA[i] == "None":
+                tokens_TCR, segments_TCR = get_tokens_and_segments(list(TRB[i]), None)
+            else:
+                tokens_TCR, segments_TCR = get_tokens_and_segments(list(TRB[i]), list(TRA[i]))
+            valid_len_TCR_res.append(len(tokens_TCR))
+            tokens_TCR = tokens_TCR + ["<pad>"] * (47 - len(tokens_TCR))
+            tokens_TCR = [vocab[a] for a in tokens_TCR]
+            segments_TCR = segments_TCR + [2] * (47 - len(segments_TCR))
+            tokens_TCR_res.append(tokens_TCR)
+            segments_TCR_res.append(segments_TCR)
             # MHC
             tokens_MHC, segments_MHC = get_tokens_and_segments(list(MHC[i]), None)
             valid_len_MHC_res.append(len(tokens_MHC))
@@ -290,29 +393,36 @@ class TCR_DataSet(Data.Dataset):
             segments_peptide = segments_peptide + [2] * (14 - len(segments_peptide))
             segments_peptide_res.append(segments_peptide)
             # decoder
+            valid_len_pMT_res.append(97)
             valid_len_pMHC_res.append(50)
+        self.tokens_TCR_res = torch.tensor([tokens_TCR_res]).reshape(-1, 47)
+        self.segments_TCR_res = torch.tensor([segments_TCR_res]).reshape(-1, 47)
+        self.valid_len_TCR_res = torch.tensor(valid_len_TCR_res)
         self.tokens_MHC_res = torch.tensor([tokens_MHC_res]).reshape(-1, 36)
         self.segments_MHC_res = torch.tensor([segments_MHC_res]).reshape(-1, 36)
         self.valid_len_MHC_res = torch.tensor(valid_len_MHC_res)
         self.tokens_peptide_res = torch.tensor([tokens_peptide_res]).reshape(-1, 14)
         self.segments_peptide_res = torch.tensor([segments_peptide_res]).reshape(-1, 14)
         self.valid_len_peptide_res = torch.tensor(valid_len_peptide_res)
+        self.valid_len_pMT_res = torch.tensor(valid_len_pMT_res)
         self.valid_len_pMHC_res = torch.tensor(valid_len_pMHC_res)
         self.labels = torch.tensor(labels)
 
     def __len__(self):
-        return self.tokens_MHC_res.shape[0]
+        return self.tokens_TCR_res.shape[0]
 
     def __getitem__(self, idx):
-        return [self.tokens_MHC_res[idx], self.segments_MHC_res[idx], self.valid_len_MHC_res[idx],
+        return [self.tokens_TCR_res[idx], self.segments_TCR_res[idx], self.valid_len_TCR_res[idx], 
+                 self.tokens_MHC_res[idx], self.segments_MHC_res[idx], self.valid_len_MHC_res[idx],
                  self.tokens_peptide_res[idx], self.segments_peptide_res[idx], self.valid_len_peptide_res[idx],
-                 self.valid_len_pMHC_res[idx]], self.labels[idx]
+                 self.valid_len_pMT_res[idx], self.valid_len_pMHC_res[idx]], self.labels[idx]
 
 
 def train_model(model, traindataloader, train_rate, criterion, optimizer, lr_scheduler, num_epochs):
     batch_num = len(traindataloader)
     train_batch_num = round(batch_num * train_rate)
     best_model_wts = copy.deepcopy(model.state_dict())
+    best_acc = 0.0
     train_loss_all = []
     train_acc_all = []
     val_loss_all = []
@@ -320,8 +430,8 @@ def train_model(model, traindataloader, train_rate, criterion, optimizer, lr_sch
     since = time.time()
 
     for epoch in range(num_epochs):
-        print('-' * 20)
         print('Epoch {}/{}'.format(epoch, num_epochs - 1))
+        print('-' * 20)
         train_loss = 0.0
         train_corrects = 0
         train_num = 0
@@ -329,40 +439,48 @@ def train_model(model, traindataloader, train_rate, criterion, optimizer, lr_sch
         val_corrects = 0
         val_num = 0
         for step, (data, label) in enumerate(traindataloader):
-            tokens_MHC_res = data[0]
-            segments_MHC_res = data[1]
-            valid_len_MHC_res = data[2]
-            tokens_peptide_res = data[3]
-            segments_peptide_res = data[4]
-            valid_len_peptide_res = data[5]
-            valid_len_pMHC_res = data[6]
+            tokens_TCR_res = data[0]
+            segments_TCR_res = data[1]
+            valid_len_TCR_res = data[2]
+            tokens_MHC_res = data[3]
+            segments_MHC_res = data[4]
+            valid_len_MHC_res = data[5]
+            tokens_peptide_res = data[6]
+            segments_peptide_res = data[7]
+            valid_len_peptide_res = data[8]
+            valid_len_pMT_res = data[9]
+            valid_len_pMHC_res = data[10]
             labels = label
             if step < (train_batch_num-1):
                 model.train()
-                output = model(tokens_MHC_res.to(device), segments_MHC_res.to(device), valid_len_MHC_res.to(device),
-                               tokens_peptide_res.to(device), segments_peptide_res.to(device), valid_len_peptide_res.to(device),
-                               valid_len_pMHC_res.to(device))
+                encoder_TCR, _, _ = TCR_encoder(tokens_TCR_res.to(device), segments_TCR_res.to(device), valid_len_TCR_res.to(device), None)
+                _, encoder_pMHC, decoder_pMHC = pMHC_encoder(tokens_MHC_res.to(device), segments_MHC_res.to(device), valid_len_MHC_res.to(device),
+                                                             tokens_peptide_res.to(device), segments_peptide_res.to(device), valid_len_peptide_res.to(device),
+                                                             valid_len_pMHC_res.to(device))
+                output = model(encoder_TCR.to(device), encoder_pMHC.to(device), valid_len_pMT_res.to(device))
                 labels = labels.to(device)
                 pre_lab = torch.argmax(output, 1)
                 loss = criterion(output, labels.long()).to(device)
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                train_loss += loss.item() * tokens_MHC_res.size(0)
+                train_loss += loss.item() * tokens_TCR_res.size(0)
                 train_corrects += torch.sum(pre_lab == labels.data)
-                train_num += tokens_MHC_res.size(0)
+                train_num += tokens_TCR_res.size(0)
                 torch.cuda.empty_cache()
             else:
                 model.eval()
-                output = model(tokens_MHC_res.to(device), segments_MHC_res.to(device), valid_len_MHC_res.to(device),
-                               tokens_peptide_res.to(device), segments_peptide_res.to(device), valid_len_peptide_res.to(device),
-                               valid_len_pMHC_res.to(device))
+                encoder_TCR, _, _ = TCR_encoder(tokens_TCR_res.to(device), segments_TCR_res.to(device), valid_len_TCR_res.to(device), None)
+                _, encoder_pMHC, decoder_pMHC = pMHC_encoder(tokens_MHC_res.to(device), segments_MHC_res.to(device), valid_len_MHC_res.to(device),
+                                                             tokens_peptide_res.to(device), segments_peptide_res.to(device), valid_len_peptide_res.to(device),
+                                                             valid_len_pMHC_res.to(device))
+                output = model(encoder_TCR.to(device), encoder_pMHC.to(device), valid_len_pMT_res.to(device))
                 labels = labels.to(device)
                 pre_lab = torch.argmax(output, 1)
                 loss = criterion(output, labels.long())
-                val_loss += loss.item() * tokens_MHC_res.size(0)
+                val_loss += loss.item() * tokens_TCR_res.size(0)
                 val_corrects += torch.sum(pre_lab == labels.data)
-                val_num += tokens_MHC_res.size(0)
+                val_num += tokens_TCR_res.size(0)
                 torch.cuda.empty_cache()
         lr_scheduler.step()
 
@@ -372,7 +490,10 @@ def train_model(model, traindataloader, train_rate, criterion, optimizer, lr_sch
         val_acc_all.append(val_corrects.double().item() / val_num)
         print('{} Train loss: {:4f} train acc: {:4f}'.format(epoch, train_loss_all[-1], train_acc_all[-1]))
         print('{} Val loss: {:4f} val acc: {:4f}'.format(epoch, val_loss_all[-1], val_acc_all[-1]))
-        torch.cuda.empty_cache()
+        torch.cuda.empty_cache()    
+        if val_acc_all[-1] > best_acc:
+            best_acc = val_acc_all[-1]
+            best_model_wts = copy.deepcopy(model.state_dict())
         time_use = time.time() - since
         print("Train and val complete in {:0f}m {:0f}s".format(time_use // 60, time_use % 60))
     train_process = pd.DataFrame(data={"epoch": range(num_epochs),
@@ -386,12 +507,22 @@ def train_model(model, traindataloader, train_rate, criterion, optimizer, lr_sch
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(device)
 
-model = pMHC_net()
+TCR_encoder = Transformer()
+TCR_encoder.load_state_dict(torch.load("./TCR_pretrain_model.pkl", map_location=torch.device('cpu')))
+TCR_encoder = TCR_encoder.to(device)
+
+pMHC_encoder = pMHC_net()
+pMHC_encoder.load_state_dict(torch.load("./pMHC_pretrain_model.pkl", map_location=torch.device('cpu')))
+pMHC_encoder = pMHC_encoder.to(device)
+
+model = TCR_net()
 print(model)
 
-data = pd.read_csv("./pMHC_pretrain_data.csv")
-print("There are " + str(len(data["MHC"].to_list())) + " sequences in the dataset.")
+
+data = pd.read_csv("./TransTCR_train_data.csv")
+print("There are " + str(len(data["TCRB"].to_list())) + " sequences in the dataset.")
 train_data_iter = Data.DataLoader(TCR_DataSet(data), batch_size = 64, shuffle = True)
+
 
 print("-----------------------------------------------------------------")
 optimizer = torch.optim.Adam(model.parameters(), lr=0.00001)
@@ -400,5 +531,6 @@ StepLR = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.9)
 model = model.to(device)
 model, train_process = train_model(model, train_data_iter, 0.9, criterion, optimizer, StepLR, num_epochs=100)
 
-torch.save(model.state_dict(), "./pMHC_pretrain_model.pkl")
+
+torch.save(model.state_dict(), "../model/TransTCR_model.pkl")
 print('Model is saved')
