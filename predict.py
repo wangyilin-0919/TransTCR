@@ -383,11 +383,11 @@ if __name__ == "__main__":
     # 可选参数 (带默认值)
     parser.add_argument("--output_csv", type=str, default="./output/predictions.csv", 
                         help="Path to save the output CSV file with predictions.")
-    parser.add_argument("--tcr_model", type=str, default="../model/TCR_pretrain_model.pkl", 
+    parser.add_argument("--tcr_model", type=str, default="./model/TCR_pretrain_model.pkl", 
                         help="Path to the pretrained TCR model.")
-    parser.add_argument("--pmhc_model", type=str, default="../model/pMHC_pretrain_model.pkl", 
+    parser.add_argument("--pmhc_model", type=str, default="./model/pMHC_pretrain_model.pkl", 
                         help="Path to the pretrained pMHC model.")
-    parser.add_argument("--transtcr_model", type=str, default="../model/TransTCR_model.pkl",
+    parser.add_argument("--transtcr_model", type=str, default="./model/TransTCR_model.pkl",
                         help="Path to the downstream TransTCR model.")
     parser.add_argument("--device", type=str, default="cpu", 
                         help="Device to run inference ('cuda:0' or 'cpu'). Defaults to cuda if available.")
