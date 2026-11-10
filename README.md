@@ -18,9 +18,8 @@ conda activate transtcr
 
 # Install required packages
 pip install torch>=1.10.0
-pip install pandas>=1.3.0
-pip install numpy>=1.20.0
-pip install scikit-learn>=1.0.0
+pip install pandas==1.5.3
+pip install numpy==1.22.4
 ```
 
 ## Quick Start
@@ -46,7 +45,7 @@ python predict.py --input_csv ./input/test.csv
 
 - `--output_csv`: Path to save the results (default: `./output/predictions.csv`)
 - `--batch_size`: Batch size for inference (default: 2048)
-- `--device`: `cuda:0` or `cpu` (auto-detected by default)
+- `--device`: `cuda:0` or `cpu` (default: `cpu`)
 - `--tcr_model`：Path to the pretrained TCR model (default: `./model/TCR_pretrain_model.pkl`)
 - `--pmhc_model`:Path to the pretrained pMHC model (default: `./model/pMHC_pretrain_model.pkl`)
 - `--transtcr_model`:Path to the downstream TransTCR model (default: `./model/TransTCR_model.pkl`)
