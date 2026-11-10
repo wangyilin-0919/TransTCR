@@ -17,7 +17,6 @@ conda create -n transtcr python=3.9
 conda activate transtcr
 
 # Install required packages
-# Note: You can also generate a requirements.txt in your local environment using `pip freeze > requirements.txt`
 pip install torch>=1.10.0
 pip install pandas>=1.3.0
 pip install numpy>=1.20.0
