@@ -317,30 +317,56 @@ class TCR_DataSet(Data.Dataset):
 def predict_and_evaluate(args):
     device = torch.device(args.device if args.device else ("cuda:0" if torch.cuda.is_available() else "cpu"))
     print(f"Using device: {device}")
-
     # 加载模型
     print("Loading models...")
     TCR_encoder = Transformer()
-    TCR_encoder.load_state_dict(torch.load(args.tcr_model, map_location=device))
+    TCR_encoder.load_state_dict(torch.load(args.tcr_model, map_location=device, weights_only=True))
     TCR_encoder = TCR_encoder.to(device)
     TCR_encoder.eval()
-
+    
     pMHC_encoder = pMHC_net()
-    pMHC_encoder.load_state_dict(torch.load(args.pmhc_model, map_location=device))
+    pMHC_encoder.load_state_dict(torch.load(args.pmhc_model, map_location=device, weights_only=True))
     pMHC_encoder = pMHC_encoder.to(device)
     pMHC_encoder.eval()
 
     model = TCR_net()
-    model.load_state_dict(torch.load(args.transtcr_model, map_location=device))
+    model.load_state_dict(torch.load(args.transtcr_model, map_location=device, weights_only=True))
     model = model.to(device)
     model.eval()
 
     # 读取数据
     print(f"Loading data from {args.input_csv}...")
-    test_df = pd.read_csv(args.input_csv).fillna("None")
+    test_df = pd.read_csv(args.input_csv)
+    
+    # 1. 将MHC列改名叫MHC_name
+    if 'MHC' in test_df.columns:
+        test_df.rename(columns={'MHC': 'MHC_name'}, inplace=True)
+    else:
+        raise ValueError("Input CSV must contain a 'MHC' column.")
+
+    # 2. 读取PseudoSequence_seq.csv并进行映射
+    # 假设伪序列文件是用 Tab 或空格分隔的，如果没有表头，我们手动指定列名
+    pseudo_df = pd.read_csv("./test_data/pMHC_pretrain_test/PseudoSequence_seq.csv", header=None, names=['HLA_name', 'sequence'])
+    
+    # 构建字典映射 (去除可能存在的空格)
+    pseudo_df['HLA_name'] = pseudo_df['HLA_name'].str.strip()
+    pseudo_df['sequence'] = pseudo_df['sequence'].str.strip()
+    pseudo_df = pseudo_df[(pseudo_df['sequence'] != 'nan') & (pseudo_df['sequence'] != '')]
+    hla_seq_map = dict(zip(pseudo_df['HLA_name'], pseudo_df['sequence']))
+
+    # 3. 根据MHC_name匹配序列，替换MHC列
+    test_df['MHC_name'] = test_df['MHC_name'].astype(str).str.strip()
+    test_df['MHC'] = test_df['MHC_name'].map(hla_seq_map)
+
+    # 检查是否有未匹配到的HLA
+    missing_mhc = test_df[test_df['MHC'].isna()]['MHC_name'].unique()
+    if len(missing_mhc) > 0:
+        raise ValueError(f"Could not find pseudo-sequences for the following MHC alleles: {list(missing_mhc)}. Please check your input or the pseudo-sequence file.")
+
+    # 后续处理（原来的 fillna 逻辑）
+    test_df = test_df.fillna("None")
     has_labels = "labels" in test_df.columns
     
-    # 如果数据集很大，建议使用小一点的 batch_size 避免 OOM。原代码直接使用了全量数据。
     batch_size = args.batch_size if args.batch_size else len(test_df["TCRB"].to_list())
     test_data_iter = Data.DataLoader(TCR_DataSet(test_df), batch_size=batch_size, shuffle=False)
 
@@ -370,8 +396,11 @@ def predict_and_evaluate(args):
     # 写入预测结果
     test_df["Prediction"] = all_outputs
     test_df["Score"] = all_output_softmax[:, 1]
+    
+    # 为了保持输出文件整洁，可以将原本的MHC序列列删掉，或者保留以作核对。这里保留，方便用户查看。
     test_df.to_csv(args.output_csv, index=False)
     print(f"Predictions saved to {args.output_csv}")
+
 
 
 if __name__ == "__main__":
